@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.31.1"
+chumsky = "0.10"

@@ -1,107 +1,323 @@
+use chumsky::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Div, Mul, Sub};
 use std::vec;
 
 pub use crate::types::*;
 
-pub fn compile(input: &String) -> Result<(Vec<Inst>, HashSet<String>), LpErr> {
-    let ast = parse_expr(&parse_sexpr(tokenize(format!("({})", input)))?)?;
-    generate_ir(&ast)
+#[derive(Debug, PartialEq, Clone)]
+enum Statement {
+    Expression(Expr),
+    Assignment { name: String, value: Expr },
 }
 
-fn tokenize(expr: impl Into<String>) -> Vec<Token> {
-    expr.into().replace('(', "( ")
-        .replace(')', " )")
-        .split_ascii_whitespace()
-        .map(|s| match s {
-            "(" => Token::Open,
-            ")" => Token::Close,
-            _ => Token::Sym(s.to_string()),
-        })
-        .collect::<Vec<Token>>()
+#[derive(Debug, PartialEq, Clone)]
+struct Program {
+    statements: Vec<Statement>,
 }
 
-/// Parse a list of tokens into an s-expression 'tree'. If parentheses are unmatched, this function
-/// returns an error.
-fn parse_sexpr(mut tokens: Vec<Token>) -> Result<SExpr, LpErr> {
-    let result = parse_sexpr_(&mut tokens)?;
-    if tokens.is_empty() {
-        Ok(result)
-    } else {
-        Err(LpErr::SExpr(format!("leftover tokens: `{tokens:?}`")))
-    }
+fn expression_parser<'src>(
+) -> impl Parser<'src, &'src str, Expr, extra::Err<Rich<'src, char>>> + Clone {
+    recursive(|expr| {
+        let number = text::int(10).from_str().unwrapped().map(Expr::Num).padded();
+        let ident = text::ident().padded();
+        let variable = ident.map(|s: &str| Expr::Var(s.to_string()));
+
+        let atom = choice((
+            number,
+            variable,
+            expr.clone().delimited_by(just('('), just(')')).padded(),
+        ));
+
+        let unary = just('-')
+            .padded()
+            .repeated()
+            .foldr(atom.clone(), |_op, rhs| {
+                Expr::UnaryOp(Operator::Sub, Box::new(rhs))
+            });
+
+        let op = |c: char| just(c).padded();
+
+        let factor = unary.clone().foldl(
+            choice((op('*').to(Operator::Mul), op('/').to(Operator::Div)))
+                .then(unary)
+                .repeated(),
+            |lhs, (op, rhs)| Expr::BinaryOp(Box::new(lhs), op, Box::new(rhs)),
+        );
+
+        factor.clone().foldl(
+            choice((op('+').to(Operator::Add), op('-').to(Operator::Sub)))
+                .then(factor)
+                .repeated(),
+            |lhs, (op, rhs)| Expr::BinaryOp(Box::new(lhs), op, Box::new(rhs)),
+        )
+    })
 }
 
-fn parse_sexpr_(tokens: &mut Vec<Token>) -> Result<SExpr, LpErr> {
-    match tokens.remove(0) {
-        Token::Open => {
-            let mut list = Vec::new();
-            while !matches!(tokens.first(), Some(Token::Close)) {
-                list.push(parse_sexpr_(tokens)?);
-                if tokens.is_empty() {
-                    return Err(LpErr::SExpr("unclosed list".to_string()));
+fn statement_parser<'src>() -> impl Parser<'src, &'src str, Statement, extra::Err<Rich<'src, char>>>
+{
+    let expr = expression_parser();
+    let ident = text::ident().padded();
+
+    let assignment = ident
+        .then_ignore(just('=').padded())
+        .then(expr.clone())
+        .map(|(name, value)| Statement::Assignment {
+            name: name.to_string(),
+            value,
+        });
+
+    let expression = expr.map(Statement::Expression);
+
+    choice((assignment, expression))
+}
+
+fn program_parser<'src>() -> impl Parser<'src, &'src str, Program, extra::Err<Rich<'src, char>>> {
+    let statement = statement_parser();
+
+    statement
+        .padded()
+        .separated_by(just(';').padded())
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .map(|statements| Program { statements })
+}
+
+fn fold_constants(expr: Expr) -> Result<Expr, LpErr> {
+    match expr {
+        Expr::BinaryOp(left, op, right) => {
+            let left = fold_constants(*left)?;
+            let right = fold_constants(*right)?;
+
+            if op == Operator::Div {
+                if let Expr::Num(0) = right {
+                    return Err(LpErr::Compile("Division by zero detected".to_string()));
                 }
             }
-            assert_eq!(tokens.remove(0), Token::Close); // consume Rparen
-            Ok(SExpr::List(list))
-        }
-        Token::Close => Err(LpErr::SExpr("unexpected ')'".to_string())),
-        Token::Sym(s) => Ok(SExpr::Sym(s)),
-    }
-}
 
-/// Parse an s-expression into an expression tree. Checks for symbol name legality, tries to parse
-/// numbers, and extracts valid unary and binary operations.
-fn parse_expr(sexpr: &SExpr) -> Result<Expr, LpErr> {
-    match sexpr {
-        SExpr::Sym(s) => match s.as_str() {
-            _ if s.contains(&['+', '-', '*', '/']) => Err(LpErr::Parse(format!("`{}` is not a legal expression or symbol name", s))),
-            _ => match s.parse::<i32>() {
-                Ok(n) => Ok(Expr::Num(n)),
-                Err(_) => Ok(Expr::Var(s.to_string())),
+            match (&left, &op, &right) {
+                (Expr::Num(0), Operator::Add, _) => Ok(right),
+                (_, Operator::Add, Expr::Num(0)) => Ok(left),
+                (_, Operator::Sub, Expr::Num(0)) => Ok(left),
+                (Expr::Num(0), Operator::Mul, _) | (_, Operator::Mul, Expr::Num(0)) => {
+                    Ok(Expr::Num(0))
+                }
+                (Expr::Num(1), Operator::Mul, _) => Ok(right),
+                (_, Operator::Mul, Expr::Num(1)) => Ok(left),
+                (_, Operator::Div, Expr::Num(1)) => Ok(left),
+                (Expr::Num(a), Operator::Add, Expr::Num(b)) => Ok(Expr::Num(a + b)),
+                (Expr::Num(a), Operator::Sub, Expr::Num(b)) => Ok(Expr::Num(a - b)),
+                (Expr::Num(a), Operator::Mul, Expr::Num(b)) => Ok(Expr::Num(a * b)),
+                (Expr::Num(a), Operator::Div, Expr::Num(b)) => {
+                    if *b == 0 {
+                        Err(LpErr::Compile("Division by zero detected".to_string()))
+                    } else {
+                        Ok(Expr::Num(a / b))
+                    }
+                }
+                _ => Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right))),
             }
         }
-        SExpr::List(es) => match es.as_slice() {
-            [e @ SExpr::List(..)] => parse_expr(e),
-            [SExpr::Sym(op), e] => Ok(Expr::UnaryOp(parse_op(op)?, Box::new(parse_expr(e)?))),
-            [a, SExpr::Sym(op), b] => Ok(Expr::BinaryOp(Box::new(parse_expr(a)?), parse_op(op)?, Box::new(parse_expr(b)?))),
-            es if es.len() == 4 => Err(LpErr::Parse(format!("`{}` is not a legal expression: too many symbols", sexpr))),
-            [a, op @ SExpr::Sym(..), b, ts @ ..] => {
-                // Try to parse e.g. (a <op> b + 3 ...) into ((a <op> b) + 3 ...)
-                let mut tmp = vec![SExpr::List(vec![a.clone(), op.clone(), b.clone()])];
-                tmp.extend_from_slice(ts);
-                parse_expr(&SExpr::List(tmp))
-            },
-            _ => Err(LpErr::Parse(format!("`{}` is not a legal expression", sexpr))),
+        Expr::UnaryOp(op, expr) => {
+            let expr = fold_constants(*expr)?;
+            match (&op, &expr) {
+                (Operator::Sub, Expr::UnaryOp(Operator::Sub, inner)) => Ok((**inner).clone()),
+                (Operator::Sub, Expr::Num(n)) => Ok(Expr::Num(-n)),
+                _ => Ok(Expr::UnaryOp(op, Box::new(expr))),
+            }
+        }
+        _ => Ok(expr),
+    }
+}
+
+fn extract_factors(left: &Expr, right: &Expr) -> Vec<Expr> {
+    let left_factors = get_multiplication_factors(left);
+    let right_factors = get_multiplication_factors(right);
+
+    let mut common_factors = Vec::new();
+
+    for left_factor in &left_factors {
+        for right_factor in &right_factors {
+            if expressions_equal(left_factor, right_factor) {
+                common_factors.push(left_factor.clone());
+            }
+        }
+    }
+
+    common_factors
+}
+
+fn get_multiplication_factors(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp(left, Operator::Mul, right) => {
+            let mut factors = get_multiplication_factors(left);
+            factors.extend(get_multiplication_factors(right));
+            factors
+        }
+        _ => vec![expr.clone()],
+    }
+}
+
+fn expressions_equal(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Num(n1), Expr::Num(n2)) => n1 == n2,
+        (Expr::Var(v1), Expr::Var(v2)) => v1 == v2,
+        (Expr::UnaryOp(op1, e1), Expr::UnaryOp(op2, e2)) => op1 == op2 && expressions_equal(e1, e2),
+        (Expr::BinaryOp(l1, op1, r1), Expr::BinaryOp(l2, op2, r2)) => {
+            op1 == op2 && expressions_equal(l1, l2) && expressions_equal(r1, r2)
+        }
+        _ => false,
+    }
+}
+
+fn remove_factor_from_expr(expr: &Expr, factor: &Expr) -> Expr {
+    match expr {
+        Expr::BinaryOp(left, Operator::Mul, right) => {
+            if expressions_equal(left, factor) {
+                (**right).clone()
+            } else if expressions_equal(right, factor) {
+                (**left).clone()
+            } else {
+                let new_left = remove_factor_from_expr(left, factor);
+                let new_right = remove_factor_from_expr(right, factor);
+
+                if expressions_equal(&new_left, left) && expressions_equal(&new_right, right) {
+                    expr.clone()
+                } else {
+                    Expr::BinaryOp(Box::new(new_left), Operator::Mul, Box::new(new_right))
+                }
+            }
+        }
+        _ => {
+            if expressions_equal(expr, factor) {
+                Expr::Num(1)
+            } else {
+                expr.clone()
+            }
         }
     }
 }
 
-fn parse_op(op: &String) -> Result<Operator, LpErr> {
-    match op.as_str() {
-        "+" => Ok(Operator::Add),
-        "-" => Ok(Operator::Sub),
-        "*" => Ok(Operator::Mul),
-        "/" => Ok(Operator::Div),
-        _ => Err(LpErr::Parse(format!("unknown operator `{}`", op)))
+fn extract_common_factors(expr: Expr) -> Result<Expr, LpErr> {
+    match expr {
+        Expr::BinaryOp(left, Operator::Add, right) => {
+            let left = extract_common_factors(*left)?;
+            let right = extract_common_factors(*right)?;
+
+            let common_factors = extract_factors(&left, &right);
+
+            if !common_factors.is_empty() {
+                let factor = &common_factors[0];
+                let left_remainder = remove_factor_from_expr(&left, factor);
+                let right_remainder = remove_factor_from_expr(&right, factor);
+
+                let sum = Expr::BinaryOp(
+                    Box::new(left_remainder),
+                    Operator::Add,
+                    Box::new(right_remainder),
+                );
+
+                Ok(Expr::BinaryOp(
+                    Box::new(factor.clone()),
+                    Operator::Mul,
+                    Box::new(sum),
+                ))
+            } else {
+                Ok(Expr::BinaryOp(
+                    Box::new(left),
+                    Operator::Add,
+                    Box::new(right),
+                ))
+            }
+        }
+        Expr::BinaryOp(left, op, right) => {
+            let left = extract_common_factors(*left)?;
+            let right = extract_common_factors(*right)?;
+            Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
+        }
+        Expr::UnaryOp(op, expr) => {
+            let expr = extract_common_factors(*expr)?;
+            Ok(Expr::UnaryOp(op, Box::new(expr)))
+        }
+        _ => Ok(expr),
     }
 }
 
-fn generate_ir(ast: &Expr) -> Result<(Vec<Inst>, HashSet<String>), LpErr> {
-    let mut reg_counter = 0;
-    let mut code: Vec<Inst> = vec![];
-    let mut variables = HashSet::new();
-
-    let result_reg = ast_to_ir(ast, &mut reg_counter, &mut code, &mut variables)?;
-    code.push(Inst::Result(u8tochar(result_reg)));
-    Ok((code, variables))
+fn collect_used_variables(expr: &Expr, used: &mut HashSet<String>) {
+    match expr {
+        Expr::Var(name) => {
+            used.insert(name.clone());
+        }
+        Expr::BinaryOp(left, _, right) => {
+            collect_used_variables(left, used);
+            collect_used_variables(right, used);
+        }
+        Expr::UnaryOp(_, expr) => {
+            collect_used_variables(expr, used);
+        }
+        Expr::Num(_) => {}
+    }
 }
 
-fn u8tochar(reg: u8) -> char {
-    char::from_digit(reg as u32 + 10, 36).unwrap()
+fn eliminate_dead_code(program: &Program) -> Program {
+    let mut used_variables = HashSet::new();
+    let mut result_statements = Vec::new();
+
+    let mut last_expr = None;
+    for statement in &program.statements {
+        match statement {
+            Statement::Expression(expr) => {
+                last_expr = Some(expr);
+            }
+            Statement::Assignment { .. } => {}
+        }
+    }
+
+    if let Some(expr) = last_expr {
+        collect_used_variables(expr, &mut used_variables);
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for statement in &program.statements {
+            if let Statement::Assignment { name, value } = statement {
+                if used_variables.contains(name) {
+                    let old_size = used_variables.len();
+                    collect_used_variables(value, &mut used_variables);
+                    if used_variables.len() > old_size {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for statement in &program.statements {
+        match statement {
+            Statement::Expression(_) => {
+                result_statements.push(statement.clone());
+            }
+            Statement::Assignment { name, .. } => {
+                if used_variables.contains(name) {
+                    result_statements.push(statement.clone());
+                }
+            }
+        }
+    }
+
+    Program {
+        statements: result_statements,
+    }
 }
 
-fn ast_to_ir(ast: &Expr, next_reg: &mut u8, code: &mut Vec<Inst>, variables: &mut HashSet<String>) -> Result<u8, LpErr> {
+fn ast_to_ir(
+    ast: &Expr,
+    next_reg: &mut u8,
+    code: &mut Vec<Inst>,
+    variables: &mut HashSet<String>,
+    var_registers: &HashMap<String, u8>,
+) -> Result<u8, LpErr> {
     match ast {
         Expr::Num(n) => {
             let reg = *next_reg;
@@ -110,22 +326,26 @@ fn ast_to_ir(ast: &Expr, next_reg: &mut u8, code: &mut Vec<Inst>, variables: &mu
             Ok(reg)
         }
         Expr::Var(v) => {
-            let reg = *next_reg; // TODO: avoid duplicate register mapping+transfer
-            code.push(Inst::Transfer(v.clone(), u8tochar(reg)));
-            variables.insert(v.clone());
-            *next_reg += 1;
-            Ok(reg)
+            if let Some(&reg) = var_registers.get(v) {
+                Ok(reg)
+            } else {
+                let reg = *next_reg;
+                code.push(Inst::Transfer(v.clone(), u8tochar(reg)));
+                variables.insert(v.clone());
+                *next_reg += 1;
+                Ok(reg)
+            }
         }
         Expr::UnaryOp(Operator::Sub, e) => {
-            let left_reg = ast_to_ir(&Expr::Num(0), next_reg, code, variables)?;
-            let right_reg = ast_to_ir(e, next_reg, code, variables)?;
+            let left_reg = ast_to_ir(&Expr::Num(0), next_reg, code, variables, var_registers)?;
+            let right_reg = ast_to_ir(e, next_reg, code, variables, var_registers)?;
             code.push(Inst::Sub(u8tochar(left_reg), u8tochar(right_reg)));
             Ok(right_reg)
         }
         Expr::UnaryOp(op, _) => Err(LpErr::IR(format!("invalid unary operator `{op}`"))),
         Expr::BinaryOp(left, op, right) => {
-            let left_reg = ast_to_ir(left, next_reg, code, variables)?;
-            let right_reg = ast_to_ir(right, next_reg, code, variables)?;
+            let left_reg = ast_to_ir(left, next_reg, code, variables, var_registers)?;
+            let right_reg = ast_to_ir(right, next_reg, code, variables, var_registers)?;
 
             let inst = match op {
                 Operator::Add => Inst::Add(u8tochar(left_reg), u8tochar(right_reg)),
@@ -140,7 +360,128 @@ fn ast_to_ir(ast: &Expr, next_reg: &mut u8, code: &mut Vec<Inst>, variables: &mu
     }
 }
 
-pub fn interpret_ir(instructions: Vec<Inst>, input_variables: &HashMap<String, String>) -> Result<i32, LpErr> {
+fn generate_ir(
+    program: &Program,
+    do_dead_code_elimination: bool,
+) -> Result<(Vec<Inst>, HashSet<String>), LpErr> {
+    let optimized_program = if do_dead_code_elimination {
+        eliminate_dead_code(program)
+    } else {
+        program.clone()
+    };
+
+    let mut reg_counter = 0;
+    let mut code: Vec<Inst> = vec![];
+    let mut variables = HashSet::new();
+    let mut var_registers = HashMap::new();
+    let mut last_reg = None;
+
+    for statement in &optimized_program.statements {
+        match statement {
+            Statement::Expression(expr) => {
+                last_reg = Some(ast_to_ir(
+                    expr,
+                    &mut reg_counter,
+                    &mut code,
+                    &mut variables,
+                    &var_registers,
+                )?);
+            }
+            Statement::Assignment { name, value } => {
+                let value_reg = ast_to_ir(
+                    value,
+                    &mut reg_counter,
+                    &mut code,
+                    &mut variables,
+                    &var_registers,
+                )?;
+                var_registers.insert(name.clone(), value_reg);
+                last_reg = Some(value_reg);
+            }
+        }
+    }
+
+    if let Some(reg) = last_reg {
+        code.push(Inst::Result(u8tochar(reg)));
+    } else {
+        return Err(LpErr::IR("No expression to evaluate".to_string()));
+    }
+
+    Ok((code, variables))
+}
+
+fn check_division_by_zero(expr: &Expr) -> Result<(), LpErr> {
+    match expr {
+        Expr::BinaryOp(_, Operator::Div, right) => {
+            if let Expr::Num(0) = **right {
+                return Err(LpErr::Compile("Division by zero detected".to_string()));
+            }
+            check_division_by_zero(right)?;
+        }
+        Expr::BinaryOp(left, _, right) => {
+            check_division_by_zero(left)?;
+            check_division_by_zero(right)?;
+        }
+        Expr::UnaryOp(_, expr) => {
+            check_division_by_zero(expr)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn compile(
+    input: &String,
+    do_constant_folding: bool,
+    do_dead_code_elimination: bool,
+    do_common_factor_extraction: bool,
+) -> Result<((Vec<Inst>, HashSet<String>), (Vec<Inst>, HashSet<String>)), LpErr> {
+    let program = program_parser()
+        .parse(input.trim())
+        .into_result()
+        .map_err(|e| LpErr::Parse(format!("Parse error: {:?}", e)))?;
+
+    // Generate unoptimized version first
+    let unoptimized_result = generate_ir(&program, false)?;
+
+    // Apply optimizations
+    let mut optimized_program = program.clone();
+    for statement in &mut optimized_program.statements {
+        match statement {
+            Statement::Expression(expr) => {
+                if do_constant_folding {
+                    *expr = fold_constants(expr.clone())?;
+                }
+                if do_common_factor_extraction {
+                    *expr = extract_common_factors(expr.clone())?;
+                }
+                check_division_by_zero(expr)?;
+            }
+            Statement::Assignment { value, .. } => {
+                if do_constant_folding {
+                    *value = fold_constants(value.clone())?;
+                }
+                if do_common_factor_extraction {
+                    *value = extract_common_factors(value.clone())?;
+                }
+                check_division_by_zero(value)?;
+            }
+        }
+    }
+
+    let optimized_result = generate_ir(&optimized_program, do_dead_code_elimination)?;
+
+    Ok((unoptimized_result, optimized_result))
+}
+
+fn u8tochar(reg: u8) -> char {
+    char::from_digit(reg as u32 + 10, 36).unwrap()
+}
+
+pub fn interpret_ir(
+    instructions: Vec<Inst>,
+    input_variables: &HashMap<String, String>,
+) -> Result<i32, LpErr> {
     let mut reg_store = HashMap::<Reg, i32>::new();
 
     for inst in instructions {
@@ -149,27 +490,52 @@ pub fn interpret_ir(instructions: Vec<Inst>, input_variables: &HashMap<String, S
             Inst::Add(a, b) => run_binop(a, b, i32::add, &mut reg_store)?,
             Inst::Sub(a, b) => run_binop(a, b, i32::sub, &mut reg_store)?,
             Inst::Mul(a, b) => run_binop(a, b, i32::mul, &mut reg_store)?,
-            Inst::Div(a, b) => run_binop(a, b, i32::div, &mut reg_store)?,
-            Inst::Store(n, reg) => if reg_store.contains_key(&reg) {
-                eprintln!("Warning: overwriting register `{reg}`.");
-                reg_store.get_mut(&reg).map(|v| *v = n);
-            } else {
-                reg_store.insert(reg, n);
+            Inst::Div(a, b) => {
+                let b_val = check_store_contains(&reg_store, b)?;
+                if b_val == 0 {
+                    return Err(LpErr::Runtime("Runtime division by zero".to_string()));
+                }
+                run_binop(a, b, i32::div, &mut reg_store)?
             }
-            Inst::Transfer(v, _) if !input_variables.contains_key(&v) => return Err(LpErr::Interpret(format!("unknown variable `{v}`"))),
-            Inst::Transfer(_, r) if reg_store.contains_key(&r) => return Err(LpErr::Interpret(format!("register `{r}` already contains value"))),
+            Inst::Store(n, reg) => {
+                if reg_store.contains_key(&reg) {
+                    eprintln!("Warning: overwriting register `{reg}`.");
+                    reg_store.get_mut(&reg).map(|v| *v = n);
+                } else {
+                    reg_store.insert(reg, n);
+                }
+            }
+            Inst::Transfer(v, _) if !input_variables.contains_key(&v) => {
+                return Err(LpErr::Interpret(format!("unknown variable `{v}`")))
+            }
+            Inst::Transfer(_, r) if reg_store.contains_key(&r) => {
+                return Err(LpErr::Interpret(format!(
+                    "register `{r}` already contains value"
+                )))
+            }
             Inst::Transfer(var, reg) => {
                 let val_str = input_variables[&var].clone();
-                let val = val_str.parse::<i32>().map_err(|_| LpErr::Interpret(format!("`{val_str}` is not a number")))?;
+                let val = val_str
+                    .parse::<i32>()
+                    .map_err(|_| LpErr::Interpret(format!("`{val_str}` is not a number")))?;
                 reg_store.insert(reg, val);
             }
-            Inst::Result(r) => return Ok(*reg_store.get(&r).ok_or(LpErr::Interpret(format!("register `{}` is empty", r)))?),
+            Inst::Result(r) => {
+                return Ok(*reg_store
+                    .get(&r)
+                    .ok_or(LpErr::Interpret(format!("register `{}` is empty", r)))?)
+            }
         }
     }
     Err(LpErr::Interpret("no result found".to_string()))
 }
 
-fn run_binop(a: Reg, b: Reg, op: impl FnOnce(i32, i32) -> i32, reg_store: &mut HashMap<Reg, i32>) -> Result<(), LpErr> {
+fn run_binop(
+    a: Reg,
+    b: Reg,
+    op: impl FnOnce(i32, i32) -> i32,
+    reg_store: &mut HashMap<Reg, i32>,
+) -> Result<(), LpErr> {
     let a = check_store_contains(reg_store, a)?;
     check_store_contains(reg_store, b)?;
     reg_store.get_mut(&b).map(|b| *b = op(a, *b));
@@ -180,122 +546,5 @@ fn check_store_contains(store: &HashMap<Reg, i32>, key: Reg) -> Result<i32, LpEr
     match store.get(&key) {
         Some(v) => Ok(*v),
         None => Err(LpErr::Interpret(format!("no such reg `{}`", key))),
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use SExpr::*;
-
-    #[test]
-    fn tokenize_example_works() -> Result<(), LpErr> {
-        let tokens = tokenize("(+ 1 (- 2 3))");
-        assert_eq!(vec![
-            Token::Open, Token::Sym("+".to_string()), Token::Sym("1".to_string()),
-            Token::Open, Token::Sym("-".to_string()), Token::Sym("2".to_string()), Token::Sym("3".to_string()),
-            Token::Close, Token::Close,
-        ], tokens);
-        Ok(())
-    }
-
-    #[test]
-    fn parse_simple_sexpr() -> Result<(), LpErr> {
-        let input1 = "(1 + 2)";
-        let input2 = "(1 + a)";
-
-        let sexpr = parse_sexpr(tokenize(input1))?;
-        assert_eq!(sexpr, List(vec![Sym("1".to_string()), Sym("+".to_string()), Sym("2".to_string())]));
-
-        let sexpr = parse_sexpr(tokenize(input2))?;
-        assert_eq!(sexpr, List(vec![Sym("1".to_string()), Sym("+".to_string()), Sym("a".to_string())]));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_complex_sexpr() -> Result<(), LpErr> {
-        let sexpr = parse_sexpr(tokenize("((1 + 2) asdf :: (a b c))"))?;
-
-        assert_eq!(sexpr, List(vec![
-            List(vec![Sym("1".to_string()), Sym("+".to_string()), Sym("2".to_string())]),
-            Sym("asdf".to_string()),
-            Sym("::".to_string()),
-            List(vec![Sym("a".to_string()), Sym("b".to_string()), Sym("c".to_string())]),
-        ]));
-        Ok(())
-    }
-    
-    #[test]
-    fn parse_invalid_sexpr() -> Result<(), LpErr> {
-        let input1 = "((1 + 1)";
-        let input2 = "(1 + 1))";
-
-        assert!(parse_sexpr(tokenize(input1)).is_err());
-        assert!(parse_sexpr(tokenize(input2)).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn parse_simple_expr() -> Result<(), LpErr> {
-        let expr = parse_expr(&parse_sexpr(tokenize("(1 + 2)"))?)?;
-
-        assert_eq!(expr, Expr::BinaryOp(Box::new(Expr::Num(1)), Operator::Add, Box::new(Expr::Num(2))));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_simple_sym() -> Result<(), LpErr> {
-        let expr = parse_expr(&parse_sexpr(tokenize("(1 + a)"))?)?;
-
-        assert_eq!(expr, Expr::BinaryOp(Box::new(Expr::Num(1)), Operator::Add, Box::new(Expr::Var("a".to_string()))));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_nested_parens() -> Result<(), LpErr> {
-        let expr = parse_expr(&parse_sexpr(tokenize("((((1 + 2))))"))?)?;
-
-        assert_eq!(expr, Expr::BinaryOp(Box::new(Expr::Num(1)), Operator::Add, Box::new(Expr::Num(2))));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_invalid_expr() -> Result<(), LpErr> {
-        let inputs = vec![
-            "(1 + 2+)",
-            "(1 + +2)",
-            "(1 + a/b)",
-            "(1 + *)",
-            "(1 1 1)",
-            "(1 (1) 1)",
-            "(1 + 1 1)",
-        ];
-        
-        for input in inputs {
-            assert!(parse_expr(&parse_sexpr(tokenize(input))?).is_err(), "`{input}` should fail");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn parse_nested_1() -> Result<(), LpErr> {
-        let expr = parse_expr(&parse_sexpr(tokenize("(1 + (2 * 3))"))?)?;
-
-        assert_eq!(expr, Expr::BinaryOp(
-            Box::new(Expr::Num(1)),
-            Operator::Add,
-            Box::new(Expr::BinaryOp(Box::new(Expr::Num(2)), Operator::Mul, Box::new(Expr::Num(3))))));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_nested_2() -> Result<(), LpErr> {
-        let expr = parse_expr(&parse_sexpr(tokenize("((1 + 2) * 3)"))?)?;
-
-        assert_eq!(expr, Expr::BinaryOp(
-            Box::new(Expr::BinaryOp(Box::new(Expr::Num(1)), Operator::Add, Box::new(Expr::Num(2)))),
-            Operator::Mul,
-            Box::new(Expr::Num(3))));
-        Ok(())
     }
 }

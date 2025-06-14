@@ -6,6 +6,8 @@ pub enum LpErr {
     Parse(String),
     IR(String),
     Interpret(String),
+    Compile(String),
+    Runtime(String),
 }
 
 impl Display for LpErr {
@@ -15,17 +17,16 @@ impl Display for LpErr {
             LpErr::Parse(e) => write!(f, "{} (parse)", e),
             LpErr::IR(e) => write!(f, "{} (ir gen)", e),
             LpErr::Interpret(e) => write!(f, "{} (interpreter)", e),
+            LpErr::Compile(e) => write!(f, "{} (compile)", e),
+            LpErr::Runtime(e) => write!(f, "{} (runtime)", e),
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Token {
-    /// Opening parenthesis `(`.
     Open,
-    /// Closing parenthesis `)`.
     Close,
-    /// Any symbol, e.g. `1`, `a`, `+`, `asdf`, `_#z1+`, that is not a parenthesis.
     Sym(String),
 }
 
@@ -42,7 +43,9 @@ impl Display for SExpr {
             SExpr::List(es) => {
                 write!(f, "(")?;
                 for (count, v) in es.iter().enumerate() {
-                    if count != 0 { write!(f, " ")?; }
+                    if count != 0 {
+                        write!(f, " ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, ")")
@@ -56,7 +59,7 @@ pub enum Operator {
     Add,
     Sub,
     Mul,
-    Div
+    Div,
 }
 
 impl Display for Operator {

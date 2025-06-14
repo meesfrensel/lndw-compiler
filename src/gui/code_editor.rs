@@ -2,7 +2,9 @@ use eframe::egui;
 
 pub struct CodeEditor {
     pub code: String,
-    do_constant_folding: bool,
+    pub do_constant_folding: bool,
+    pub do_dead_code_elimination: bool,
+    pub do_common_factor_extraction: bool,
 }
 
 impl Default for CodeEditor {
@@ -10,6 +12,8 @@ impl Default for CodeEditor {
         Self {
             code: "1 + 1".into(),
             do_constant_folding: false,
+            do_dead_code_elimination: false,
+            do_common_factor_extraction: false,
         }
     }
 }
@@ -23,16 +27,21 @@ impl CodeEditor {
 
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.do_constant_folding, "Constant folding");
+            ui.checkbox(&mut self.do_dead_code_elimination, "Dead code elimination");
+            ui.checkbox(
+                &mut self.do_common_factor_extraction,
+                "Arithmetic optimization",
+            );
         });
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.code)
-                    .font(egui::TextStyle::Monospace) // for cursor height
+                    .font(egui::TextStyle::Monospace)
                     .code_editor()
                     .desired_rows(10)
                     .lock_focus(true)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(f32::INFINITY),
             );
         });
     }
